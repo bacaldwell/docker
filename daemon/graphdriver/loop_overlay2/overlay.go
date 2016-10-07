@@ -36,17 +36,36 @@ var (
 )
 
 // This backend uses the overlay union filesystem for containers
-// with diff directories for each layer.
+// with diff directories for each layer stored in loopback file images.
+// The loopback files are either xfs or ext4 images, where xfs is chosen
+// if supported by the host.
 
-// This version of the overlay driver requires at least kernel
-// 4.0.0 in order to support mounting multiple diff directories.
+// This driver makes use of kernel capabilities in 4.0.0 or layer for
+// mounting multiple diff directories. This requirement is shared with
+// the overlay2 driver.
 
-// Each container/image has at least a "diff" directory and "link" file.
-// If there is also a "lower" file when there are diff layers
-// below  as well as "merged" and "work" directories. The "diff" directory
-// has the upper layer of the overlay and is used to capture any
-// changes to the layer. The "lower" file contains all the lower layer
-// mounts separated by ":" and ordered from uppermost to lowermost
+// There are two (configurable) locations where images are stored.
+// The first is "loopback_root" which could be a directory on shared
+// storage and mounted by many nodes running Docker Engine. If during
+// an image pull, this directory cannot be opened for writing (permission
+// denied, read-only filesystem), then the graphdriver will fallback to
+// "loopback_fallback". This directory could be on node-local storage
+// or another directory on shared storage. This location should only be
+// used by a single Docker Engine or the user should be aware of file
+// consistency implications if on a shared mount. This graphdriver does
+// not implement its own locking mechanisms.
+
+// Each container/image has loopback image stored either in "loopback_root"
+// or "loopback_fallback" where if the driver finds the image in
+// "loopback_root", it will use that image and not check
+// "loopback_fallback". The images are mounted on-demand (read-write for
+// ApplyDiff and read-only for Get) with mountpoints in the conventional
+// docker root directory tree. The image will have at least a "diff"
+// directory and "link" file. If there is also a "lower" file when there
+// are diff layers below  as well as "merged" and "work" directories.
+// The "diff" directory has the upper layer of the overlay and is used to
+// capture any changes to the layer. The "lower" file contains all the lower
+// layer mounts separated by ":" and ordered from uppermost to lowermost
 // layers. The overlay itself is mounted in the "merged" directory,
 // and the "work" dir is needed for overlay to work.
 
@@ -91,7 +110,7 @@ type Driver struct {
 
 var backingFs = "<unknown>"
 var loopbackRoot = "/var/lib/docker/loopback/root"
-var loopbackFallback = "/var/lib/docker/loopback/private"
+var loopbackFallback = "/var/lib/docker/loopback/fallback"
 
 func init() {
 	graphdriver.Register(driverName, Init)
@@ -227,7 +246,7 @@ func (d *Driver) String() string {
 func (d *Driver) Status() [][2]string {
 	return [][2]string{
 		{"Backing Filesystem", backingFs},
-		{"Loopback Root", loopbackRoot},
+		{"Loopback Root Directory", loopbackRoot},
 		{"Loopback Fallback Directory", loopbackFallback},
 	}
 }
