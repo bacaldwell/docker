@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 	"github.com/Sirupsen/logrus"
 
 	"github.com/docker/docker/daemon/graphdriver"
+	"github.com/docker/docker/daemon/graphdriver/quota"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/chrootarchive"
 	"github.com/docker/docker/pkg/directory"
@@ -26,6 +28,7 @@ import (
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/parsers"
 	"github.com/docker/docker/pkg/parsers/kernel"
+	"github.com/docker/go-units"
 
 	"github.com/opencontainers/runc/libcontainer/label"
 )
@@ -97,20 +100,33 @@ const (
 	idLength = 26
 )
 
-// Driver contains information about the home directory and the list of active mounts that are created using this driver.
-type Driver struct {
-	home    string
-	loopbackDir	string
-	filesystem string
-	mkfsArgs []string
-	uidMaps []idtools.IDMap
-	gidMaps []idtools.IDMap
-	ctr     *graphdriver.RefCounter
+type overlayOptions struct {
+	overrideKernelCheck bool
+	quota               quota.Quota
+	loopbackRoot        string
+	loopbackFallback    string
 }
 
-var backingFs = "<unknown>"
-var loopbackRoot = "/var/lib/docker/loopback/root"
-var loopbackFallback = "/var/lib/docker/loopback/fallback"
+// Driver contains information about the home directory and the list of active mounts that are created using this driver.
+type Driver struct {
+	loopbackRoot     string
+	loopbackFallback string
+	filesystem       string
+	mkfsArgs         []string
+	home             string
+	uidMaps          []idtools.IDMap
+	gidMaps          []idtools.IDMap
+	ctr              *graphdriver.RefCounter
+	quotaCtl         *quota.Control
+	options          overlayOptions
+}
+
+var (
+	backingFs             = "<unknown>"
+	projectQuotaSupported = false
+	loopbackRoot = "/var/lib/docker/loopback/root"
+	loopbackFallback = "/var/lib/docker/loopback/fallback"
+)
 
 func init() {
 	graphdriver.Register(driverName, Init)
@@ -162,14 +178,28 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		return nil, err
 	}
 
-	// Create the loopback dir
-	loopbackDir := path.Join(loopbackRoot, "devs")
+	if len(opts.loopbackRoot) > 0 {
+		loopbackRoot = opts.loopbackRoot
+	}
 
-	if err := idtools.MkdirAllAs(loopbackDir, 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
+	// Check for the loopback dir
+	_, err = os.Stat(loopbackRoot)
+	if err != nil {
+		if err := idtools.MkdirAllAs(loopbackRoot, 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
+			return nil, err
+		}
+	}
+
+	// Create the fallback loopback dir
+	if len(opts.loopbackFallback) > 0 {
+		loopbackFallback = opts.loopbackFallback
+	}
+
+	if err := idtools.MkdirAllAs(loopbackFallback, 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
 
-	if err := mount.MakePrivate(loopbackDir); err != nil {
+	if err := mount.MakePrivate(loopbackFallback); err != nil {
 		return nil, err
 	}
 
@@ -177,18 +207,24 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 
 	d := &Driver{
 		home:    home,
-		loopbackDir: loopbackDir,
+		loopbackRoot: loopbackRoot,
+		loopbackFallback: loopbackFallback,
 		filesystem: filesystem,
 		uidMaps: uidMaps,
 		gidMaps: gidMaps,
 		ctr:     graphdriver.NewRefCounter(graphdriver.NewFsChecker(graphdriver.FsMagicOverlay)),
 	}
 
-	return d, nil
-}
+	if backingFs == "xfs" {
+		// Try to enable project quota support over xfs.
+		if d.quotaCtl, err = quota.NewControl(home); err == nil {
+			projectQuotaSupported = true
+		}
+	}
 
-type overlayOptions struct {
-	overrideKernelCheck bool
+	logrus.Debugf("backingFs=%s,  projectQuotaSupported=%v", backingFs, projectQuotaSupported)
+
+	return d, nil
 }
 
 func parseOptions(options []string) (*overlayOptions, error) {
@@ -205,14 +241,16 @@ func parseOptions(options []string) (*overlayOptions, error) {
 			if err != nil {
 				return nil, err
 			}
+
 		case "loop_overlay2.loopback_root":
-			loopbackRoot = val
+			o.loopbackRoot = val
 		case "loop_overlay2.loopback_fallback":
-			loopbackFallback = val
+			o.loopbackFallback = val
 		default:
 			return nil, fmt.Errorf("loop_overlay2: Unknown option %s\n", key)
 		}
 	}
+
 	return o, nil
 }
 
@@ -293,8 +331,8 @@ func (d *Driver) CreateReadWrite(id, parent, mountLabel string, storageOpt map[s
 // The parent filesystem is used to configure these directories for the overlay.
 func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]string) (retErr error) {
 
-	if len(storageOpt) != 0 {
-		return fmt.Errorf("--storage-opt is not supported for overlay")
+	if len(storageOpt) != 0 && !projectQuotaSupported {
+		return fmt.Errorf("--storage-opt is supported only for overlay over xfs with 'pquota' mount option")
 	}
 
 	dir := d.dir(id)
@@ -316,6 +354,20 @@ func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]str
 			os.RemoveAll(dir)
 		}
 	}()
+
+	if len(storageOpt) > 0 {
+		driver := &Driver{}
+		if err := d.parseStorageOpt(storageOpt, driver); err != nil {
+			return err
+		}
+
+		if driver.options.quota.Size > 0 {
+			// Set container disk quota limit
+			if err := d.quotaCtl.SetQuota(dir, driver.options.quota); err != nil {
+				return err
+			}
+		}
+	}
 
 	if err := idtools.MkdirAs(path.Join(dir, "diff"), 0755, rootUID, rootGID); err != nil {
 		return err
@@ -356,6 +408,73 @@ func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]str
 	return nil
 }
 
+// Parse overlay storage options
+func (d *Driver) parseStorageOpt(storageOpt map[string]string, driver *Driver) error {
+	// Read size to set the disk project quota per container
+	for key, val := range storageOpt {
+		key := strings.ToLower(key)
+		switch key {
+		case "size":
+			size, err := units.RAMInBytes(val)
+			if err != nil {
+				return err
+			}
+			driver.options.quota.Size = uint64(size)
+		default:
+			return fmt.Errorf("Unknown option %s", key)
+		}
+	}
+
+	return nil
+}
+
+// findLoopbackPath will return the path of the loopback device in order
+// of preference under either directory:
+//   1. loopbackRoot
+//   2. loopbackFallback
+// If the file exists, then it returns the path found in the preference order.
+// If the file doesn't exist in either location, then the path returned will be
+// a writable path
+// Returns "" when neither path is writable
+func (d *Driver) findLoopbackPath(id string) (string) { 
+	var retPath = ""
+
+	// Check at loopbackRoot
+	retPath = path.Join(d.loopbackRoot, id)
+	_, err := os.Stat(retPath)
+	if err == nil {
+		return retPath
+	}
+
+	// Check at loopbackFallback
+	retPath = path.Join(d.loopbackFallback, id)
+	_, err = os.Stat(retPath)
+	if err == nil {
+		return retPath
+	}
+
+	// Loopback file does not exist, so return the first writable location
+
+	// Check at loopbackRoot
+	f := path.Join(loopbackRoot, ".touch")
+	err = ioutil.WriteFile(f, []byte(""), 0600)
+	if err == nil {
+		os.Remove(f)
+		return path.Join(d.loopbackRoot, id)
+	}
+
+	// Check at loopbackFallback
+	f = path.Join(loopbackFallback, ".touch")
+	err = ioutil.WriteFile(f, []byte(""), 0600)
+	if err == nil {
+		os.Remove(f)
+		return path.Join(d.loopbackFallback, id)
+	}
+
+	// Return empty string
+	return retPath
+}
+
 func (d *Driver) getLower(parent string) (string, error) {
 	parentDir := d.dir(parent)
 
@@ -364,7 +483,7 @@ func (d *Driver) getLower(parent string) (string, error) {
 		return "", err
 	}
 
-	// Read Parent link fileA
+	// Read Parent link file
 	parentLink, err := ioutil.ReadFile(path.Join(parentDir, "link"))
 	if err != nil {
 		return "", err
@@ -461,7 +580,7 @@ func (d *Driver) mountLowerIds(ids []string) (error) {
 	// ephemeral layer that belongs to the container. As such, it will not be
 	// found on shared storage
 	for _, id := range ids {
-		loopFile := path.Join(d.loopbackDir, id)
+		loopFile := d.findLoopbackPath(id)
 		_, err := os.Stat(loopFile)
 		if err == nil {
 
@@ -572,6 +691,15 @@ func (d *Driver) Get(id string, mountLabel string) (s string, err error) {
 
 	pageSize := syscall.Getpagesize()
 
+	// Go can return a larger page size than supported by the system
+	// as of go 1.7. This will be fixed in 1.8 and this block can be
+	// removed when building with 1.8.
+	// See https://github.com/golang/go/commit/1b9499b06989d2831e5b156161d6c07642926ee1
+	// See https://github.com/docker/docker/issues/27384
+	if pageSize > 4096 {
+		pageSize = 4096
+	}
+
 	// Use relative paths and mountFrom when the mount data has exceeded
 	// the page size. The mount syscall fails if the mount data cannot
 	// fit within a page and relative links make the mount data much
@@ -615,7 +743,7 @@ func (d *Driver) unmountLowerIds(ids []string) (error) {
 	for _, id := range ids {
 
 		// Check if loopfile exists. If it doesn't we skip trying to unmount it
-		loopFile := path.Join(d.loopbackDir, id)
+		loopFile := d.findLoopbackPath(id)
 		_, err := os.Stat(loopFile)
 		if err == nil {
 			mountPath := d.getDiffPath(id)
@@ -631,7 +759,6 @@ func (d *Driver) unmountLowerIds(ids []string) (error) {
 				logrus.Errorf("loop_overlay2: failed to unmount %s", mountPath)
 			}
 
-			loopFile := path.Join(d.loopbackDir, id)
 			f, err := os.Open(loopFile)
 			if err != nil {
 				return err
@@ -712,7 +839,7 @@ func (d *Driver) Exists(id string) bool {
 		return true
 	}
 
-	loopFile := path.Join(d.loopbackDir, id)
+	loopFile := d.findLoopbackPath(id)
 	_, err = os.Stat(loopFile)
 	if err == nil {
 		return true
@@ -721,8 +848,7 @@ func (d *Driver) Exists(id string) bool {
 	return false
 }
 
-// ensureImage creates a sparse file of <size> bytes at the path
-// <loopbackDir>/devs/<name>
+// ensureImage creates a sparse file of <size> bytes at the specified path
 // If the file already exists and new size is larger than its current size, it grows to the new size.
 // Either way it returns the full path.
 func (d *Driver) ensureImage(filename string, size int64) error {
@@ -832,8 +958,9 @@ func (d *Driver) createFilesystem(devname string) (err error) {
 }
 
 func (d *Driver) createLoopback(id string, size int64) (*os.File, error) {
-	filename := path.Join(d.loopbackDir, id)
 	createdLoopback := false
+
+	filename := d.findLoopbackPath(id)
 
 	_, err := os.Stat(filename)
 	if err != nil {
@@ -886,7 +1013,7 @@ func (d *Driver) MountLoopbackDevice(dev, path, mountLabel string, mountRW bool)
 
 
 // ApplyDiff applies the new layer into a root
-func (d *Driver) ApplyDiff(id string, parent string, diff archive.Reader) (size int64, err error) {
+func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64, err error) {
 	tengb := func() int64 {
 		return 1024 * 1024 * 1024 * 10
 	}
@@ -933,7 +1060,7 @@ func (d *Driver) DiffSize(id, parent string) (size int64, err error) {
 
 // Diff produces an archive of the changes between the specified
 // layer and its parent layer which may be "".
-func (d *Driver) Diff(id, parent string) (archive.Archive, error) {
+func (d *Driver) Diff(id, parent string) (io.ReadCloser, error) {
 	diffPath := d.getDiffPath(id)
 	logrus.Debugf("Tar with options on %s", diffPath)
 	return archive.TarWithOptions(diffPath, &archive.TarOptions{
