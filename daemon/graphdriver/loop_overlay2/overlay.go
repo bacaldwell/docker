@@ -24,6 +24,8 @@ import (
 	"github.com/docker/docker/pkg/chrootarchive"
 	"github.com/docker/docker/pkg/directory"
 	"github.com/docker/docker/pkg/idtools"
+	"github.com/docker/docker/image"
+	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/loopback"
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/parsers"
@@ -178,31 +180,6 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		return nil, err
 	}
 
-	if len(opts.loopbackRoot) > 0 {
-		loopbackRoot = opts.loopbackRoot
-	}
-
-	// Check for the loopback dir
-	_, err = os.Stat(loopbackRoot)
-	if err != nil {
-		if err := idtools.MkdirAllAs(loopbackRoot, 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
-			return nil, err
-		}
-	}
-
-	// Create the fallback loopback dir
-	if len(opts.loopbackFallback) > 0 {
-		loopbackFallback = opts.loopbackFallback
-	}
-
-	if err := idtools.MkdirAllAs(loopbackFallback, 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
-		return nil, err
-	}
-
-	if err := mount.MakePrivate(loopbackFallback); err != nil {
-		return nil, err
-	}
-
 	filesystem := determineDefaultFS()
 
 	d := &Driver{
@@ -213,6 +190,42 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		uidMaps: uidMaps,
 		gidMaps: gidMaps,
 		ctr:     graphdriver.NewRefCounter(graphdriver.NewFsChecker(graphdriver.FsMagicOverlay)),
+	}
+
+	if len(opts.loopbackRoot) > 0 {
+		loopbackRoot = opts.loopbackRoot
+	}
+
+	// Check for the loopback dir
+	_, err = os.Stat(loopbackRoot)
+	if err != nil {
+		if err := idtools.MkdirAllAs(loopbackRoot, 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
+			return nil, err
+		}
+	} else {
+		if err := d.mergeStores(path.Join(loopbackRoot, "layerdb")); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(opts.loopbackFallback) > 0 {
+		loopbackFallback = opts.loopbackFallback
+	}
+
+	// Check for the fallback loopback dir
+	_, err = os.Stat(loopbackFallback)
+	if err != nil {
+		if err := idtools.MkdirAllAs(loopbackFallback, 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
+			return nil, err
+		}
+	} else {
+		if err := d.mergeStores(path.Join(loopbackFallback, "layerdb")); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := mount.MakePrivate(loopbackFallback); err != nil {
+		return nil, err
 	}
 
 	if backingFs == "xfs" {
@@ -292,6 +305,8 @@ func (d *Driver) Status() [][2]string {
 // GetMetadata returns meta data about the overlay driver such as
 // LowerDir, UpperDir, WorkDir and MergeDir used to store data.
 func (d *Driver) GetMetadata(id string) (map[string]string, error) {
+	logrus.Debugf("Called GetMetadata with ID %s", id)
+
 	dir := d.dir(id)
 	if _, err := os.Stat(dir); err != nil {
 		return nil, err
@@ -324,12 +339,44 @@ func (d *Driver) Cleanup() error {
 // CreateReadWrite creates a layer that is writable for use as a container
 // file system.
 func (d *Driver) CreateReadWrite(id, parent, mountLabel string, storageOpt map[string]string) error {
+	logrus.Debugf("Called CreateReadWrite with ID %s", id)
 	return d.Create(id, parent, mountLabel, storageOpt)
+}
+
+// createParent gets called by Create when  parent layer doesn't exist. This may happen
+// if the /var/lib/docker/loop_overlay2/ directory is empty.  No problem though, as we can use
+// create to recreate the layers from the loopback devices in /var/lib/docker/loopback/.
+// This is the normal function of Create. We are just reusing it here.
+func (d *Driver) createParent(id string, mountLabel string, storageOpt map[string]string) error {
+	dir := d.dir(id)
+	if _, err := os.Lstat(dir); err != nil {
+		parentFile, err := d.getParentMetaFile(id)
+		if err != nil {
+			return err
+		}
+
+		parent, err := ioutil.ReadFile(parentFile)
+		if err != nil {
+			return err
+		}
+		
+		if err = d.createParent(string(parent), mountLabel, storageOpt); err != nil {
+			return fmt.Errorf("loop_overlay2: unable to recursively recreate layer %s\n", parent)
+		}
+
+		// Now actually create the layer. Due to recursive code above, our parent will already have called this
+		if err := d.Create(id, string(parent), mountLabel, storageOpt); err != nil {
+			return fmt.Errorf("loop_overlay2: unable to create layer %s\n", string(parent))
+		}
+	}
+
+	return nil
 }
 
 // Create is used to create the upper, lower, and merge directories required for overlay fs for a given id.
 // The parent filesystem is used to configure these directories for the overlay.
 func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]string) (retErr error) {
+	logrus.Debugf("Create called with id %s", id)
 
 	if len(storageOpt) != 0 && !projectQuotaSupported {
 		return fmt.Errorf("--storage-opt is supported only for overlay over xfs with 'pquota' mount option")
@@ -393,6 +440,18 @@ func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]str
 	}
 	if err := idtools.MkdirAs(path.Join(dir, "merged"), 0700, rootUID, rootGID); err != nil {
 		return err
+	}
+
+	parentDir := d.dir(parent)
+
+	// Ensure parent exists
+	if _, err := os.Lstat(parentDir); err != nil {
+		// This parent doesn't exist, but before we can recreate it, we have to recreate all of its
+		// lower dirs
+		logrus.Debugf("loop_overlay2: parentDir %s does not exist. Creating its ancestors first", parentDir)
+		if err = d.createParent(parent, mountLabel, storageOpt); err != nil {
+			return err
+		}
 	}
 
 	lower, err := d.getLower(parent)
@@ -524,6 +583,7 @@ func (d *Driver) getLowerDirs(id string) ([]string, error) {
 
 // Remove cleans the directories that are created for this id.
 func (d *Driver) Remove(id string) error {
+	logrus.Debugf("Calling Remove with id %s", id)
 	dir := d.dir(id)
 	lid, err := ioutil.ReadFile(path.Join(dir, "link"))
 	if err == nil {
@@ -568,7 +628,6 @@ func (d *Driver) mountLowerIds(ids []string) (error) {
 		return fmt.Errorf("loop_overlay2: no IDs of lower layers to mount")
 	}
 
-
 	var mounts []string
 	var loops []*os.File
 	var savedError error
@@ -580,6 +639,25 @@ func (d *Driver) mountLowerIds(ids []string) (error) {
 	// ephemeral layer that belongs to the container. As such, it will not be
 	// found on shared storage
 	for _, id := range ids {
+
+		// Only try to attach a loopback file where one doesn't already exist
+		/*
+		mountPath := d.getDiffPath(id)
+		mountFile, err := os.Open(mountPath)
+		if err != nil {
+			// The mount path should have been created by Create
+			return err
+		}
+
+		loopDev := loopback.FindLoopDeviceFor(mountFile)
+		defer mountFile.Close()
+
+		if loopDev != nil {
+			defer loopDev.Close()
+			continue
+		}
+		*/
+
 		loopFile := d.findLoopbackPath(id)
 		_, err := os.Stat(loopFile)
 		if err == nil {
@@ -599,7 +677,7 @@ func (d *Driver) mountLowerIds(ids []string) (error) {
 
 			// Mount the device
 			mountRW := false
-			err = d.MountLoopbackDevice(loopDev.Name(), applyDir, id, mountRW)
+			err = d.mountLoopbackDevice(loopDev.Name(), applyDir, id, mountRW)
 			if err != nil {
 				savedError = err
 				failure = true
@@ -635,8 +713,36 @@ func (d *Driver) getDiffPath(id string) string {
 	return path.Join(dir, "diff")
 }
 
+func (d *Driver) getParentMetaFile(id string) (string, error) {
+	loopFile := d.findLoopbackPath(id)
+	_, err := os.Stat(loopFile)
+	if err != nil {
+		return "", fmt.Errorf("loop_overlay2: couldn't find loopback device for ID %s, not writing parent metadata",
+				   id)
+	}
+
+	parentFile := loopFile + "-parent"
+
+	return parentFile, nil
+}
+
+func (d *Driver) writeParentMetaFile(id string, parent string) error {
+	parentFile, err := d.getParentMetaFile(id)
+	if err != nil {
+		return err
+	}
+
+	if err := ioutil.WriteFile(parentFile, []byte(parent), 0666); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // Get creates and mounts the required file system for the given id and returns the mount path.
 func (d *Driver) Get(id string, mountLabel string) (s string, err error) {
+	logrus.Debugf("Calling Get with id %s", id)
+
 	dir := d.dir(id)
 	if _, err := os.Stat(dir); err != nil {
 		return "", err
@@ -792,6 +898,8 @@ func (d *Driver) unmountLowerIds(ids []string) (error) {
 
 // Put unmounts the mount path created for the given id.
 func (d *Driver) Put(id string) error {
+	logrus.Debugf("Called Put with ID %s", id)
+
 	dir := d.dir(id)
 
 	mountpoint := path.Join(dir, "merged")
@@ -989,7 +1097,7 @@ func (d *Driver) createLoopback(id string, size int64) (*os.File, error) {
 	return loopDev, nil
 }
 
-func (d *Driver) MountLoopbackDevice(dev, path, mountLabel string, mountRW bool) error {
+func (d *Driver) mountLoopbackDevice(dev, path, mountLabel string, mountRW bool) error {
 	options := ""
 
 	if mountRW {
@@ -1014,6 +1122,8 @@ func (d *Driver) MountLoopbackDevice(dev, path, mountLabel string, mountRW bool)
 
 // ApplyDiff applies the new layer into a root
 func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64, err error) {
+	logrus.Debugf("Called ApplyDiff with ID %s", id)
+
 	tengb := func() int64 {
 		return 1024 * 1024 * 1024 * 10
 	}
@@ -1029,7 +1139,7 @@ func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64
 
 	// Mount the device
 	mountRW := true
-	if err := d.MountLoopbackDevice(loopDev.Name(), applyDir, id, mountRW); err != nil {
+	if err := d.mountLoopbackDevice(loopDev.Name(), applyDir, id, mountRW); err != nil {
 		return 0, err
 	}
 
@@ -1047,6 +1157,13 @@ func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64
 		return 0, err
 	}
 
+	if parent != "" {
+		err = d.writeParentMetaFile(id, parent)
+		if err != nil {
+			return 0, err
+		}
+	}
+
 	defer loopDev.Close()
 	return d.DiffSize(id, parent)
 }
@@ -1055,12 +1172,15 @@ func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64
 // and its parent and returns the size in bytes of the changes
 // relative to its base filesystem directory.
 func (d *Driver) DiffSize(id, parent string) (size int64, err error) {
+	logrus.Debugf("Called DiffSize with ID %s", id)
+
 	return directory.Size(d.getDiffPath(id))
 }
 
 // Diff produces an archive of the changes between the specified
 // layer and its parent layer which may be "".
 func (d *Driver) Diff(id, parent string) (io.ReadCloser, error) {
+	logrus.Debugf("Called Diff with ID %s", id)
 	diffPath := d.getDiffPath(id)
 	logrus.Debugf("Tar with options on %s", diffPath)
 	return archive.TarWithOptions(diffPath, &archive.TarOptions{
@@ -1074,6 +1194,8 @@ func (d *Driver) Diff(id, parent string) (io.ReadCloser, error) {
 // Changes produces a list of changes between the specified layer
 // and its parent layer. If parent is "", then all changes will be ADD changes.
 func (d *Driver) Changes(id, parent string) ([]archive.Change, error) {
+	logrus.Debugf("Called Changes with ID %s", id)
+
 	// Overlay doesn't have snapshots, so we need to get changes from all parent
 	// layers.
 	diffPath := d.getDiffPath(id)
@@ -1083,4 +1205,33 @@ func (d *Driver) Changes(id, parent string) ([]archive.Change, error) {
 	}
 
 	return archive.OverlayChanges(layers, diffPath)
+}
+
+func (d *Driver) mergeStores(storeDir string) error {
+
+	fms, err := layer.NewFSMetadataStore(path.Join(storeDir,"layerdb"))
+	if err != nil {
+		return err
+	}
+	layerStore, err := layer.NewStoreFromGraphDriver(fms, d)
+	if err != nil {
+		return err
+	}
+
+	ifs, err := image.NewFSStoreBackend(path.Join(storeDir, "imagedb"))
+	if err != nil {
+		return err
+	}
+
+	imageStore, err := image.NewImageStore(ifs, layerStore)
+	if err != nil {
+		return err
+	}
+
+	images := imageStore.Map()
+	for id := range images {
+		logrus.Debugf("ID=%s", id)
+	}
+
+	return nil
 }
