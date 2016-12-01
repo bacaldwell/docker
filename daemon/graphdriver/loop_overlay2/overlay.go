@@ -156,6 +156,7 @@ var (
 	loopbackFallback      = "/var/lib/docker/loopback/fallback"
 	defaultStoreDir       = "/var/lib/docker/image"
 
+	mkfsArgs []string
 	useNaiveDiffLock sync.Once
 	useNaiveDiffOnly bool
 )
@@ -225,12 +226,16 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		logrus.Warn(overlayutils.ErrDTypeNotSupported("overlay2", backingFs))
 	}
 
+	mkfsArgs = append(mkfsArgs, "-n")
+	mkfsArgs = append(mkfsArgs, "ftype=1")
+
 	d := &Driver{
 		home:             home,
 		loopbackRoot:     loopbackRoot,
 		loopbackFallback: loopbackFallback,
 		defaultStoreDir:  defaultStoreDir,
 		filesystem:       filesystem,
+		mkfsArgs:         mkfsArgs,
 		uidMaps:          uidMaps,
 		gidMaps:          gidMaps,
 		ctr:              graphdriver.NewRefCounter(graphdriver.NewFsChecker(graphdriver.FsMagicOverlay)),
@@ -493,7 +498,6 @@ func (d *Driver) createParent(id string, opts *graphdriver.CreateOpts) error {
 // Create is used to create the upper, lower, and merge directories required for overlay fs for a given id.
 // The parent filesystem is used to configure these directories for the overlay.
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
-
 	if opts != nil && len(opts.StorageOpt) != 0 && !projectQuotaSupported {
 		return fmt.Errorf("--storage-opt is supported only for overlay over xfs with 'pquota' mount option")
 	}
@@ -551,13 +555,6 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		return nil
 	}
 
-	if err := idtools.MkdirAs(path.Join(dir, "work"), 0700, rootUID, rootGID); err != nil {
-		return err
-	}
-	if err := idtools.MkdirAs(path.Join(dir, "merged"), 0700, rootUID, rootGID); err != nil {
-		return err
-	}
-
 	parentDir := d.dir(parent)
 
 	// Ensure parent exists
@@ -568,6 +565,13 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		if err = d.createParent(parent, opts); err != nil {
 			return err
 		}
+	}
+
+	if err := idtools.MkdirAs(path.Join(dir, "work"), 0700, rootUID, rootGID); err != nil {
+		return err
+	}
+	if err := idtools.MkdirAs(path.Join(dir, "merged"), 0700, rootUID, rootGID); err != nil {
+		return err
 	}
 
 	lower, err := d.getLower(parent)
@@ -760,6 +764,42 @@ func (d *Driver) findLoopAttached(loopFile string) (*os.File, error) {
 	return nil, nil
 }
 
+func (d *Driver) mountROLoopbackIfNeeded(id string, loopFile string) (string, *os.File, error) {
+	diffDir := d.getDiffPath(id)
+
+	if isMounted, err := mount.Mounted(diffDir); err != nil {
+		return "", nil, err
+	} else if isMounted {
+		// Already mounted, our work is done here
+		return diffDir, nil, nil
+	}
+
+	loopDev, err := d.findLoopAttached(loopFile)
+	if err != nil {
+		return "", nil,  err
+	} else if loopDev == nil {
+
+		// No existing loop devices are attached to loopFile
+
+		loopDev, err = loopback.AttachROLoopDevice(loopFile)
+		if err != nil {
+			return "", nil, err
+		}
+		logrus.Debugf("loop_overlay2: read-only attached loop dev %s to image %s", loopDev.Name(), loopFile)
+
+	}
+	// Else already attached, loopDev is open
+
+	// Mount the device
+	mountRW := false
+	err = d.mountLoopbackDevice(loopDev.Name(), diffDir, id, mountRW)
+	if err != nil {
+		return "", loopDev, err
+	}
+
+	return diffDir, loopDev, nil
+}
+
 func (d *Driver) mountLowerIds(ids []string) error {
 	if ids == nil {
 		return fmt.Errorf("loop_overlay2: no IDs of lower layers to mount")
@@ -773,10 +813,7 @@ func (d *Driver) mountLowerIds(ids []string) error {
 	defer func() {
 		if err != nil {
 			for i, m := range mounts {
-				err2 := syscall.Unmount(m, syscall.MNT_DETACH)
-				if err2 != nil {
-					logrus.Errorf("loop_overlay2: failed to unmount %s", m)
-				}
+				syscall.Unmount(m, syscall.MNT_DETACH)
 
 				// detach the loop device
 				defer loops[i].Close()
@@ -798,39 +835,19 @@ func (d *Driver) mountLowerIds(ids []string) error {
 			continue
 		}
 
-		applyDir := d.getDiffPath(id)
-		if isMounted, err := mount.Mounted(applyDir); err != nil {
-			return err
-		} else if isMounted {
-			// Already mounted, our work is done here
-			continue
+		applyDir, loopDev, err := d.mountROLoopbackIfNeeded(id, loopFile)
+
+		if applyDir != "" {
+			mounts = append(mounts, applyDir)
 		}
 
-		loopDev, err = d.findLoopAttached(loopFile)
-		if err != nil {
-			return err
-		} else if loopDev == nil {
-			loopDev, err = loopback.AttachROLoopDevice(loopFile)
-			if err != nil {
-				return err
-			}
-			logrus.Debugf("loop_overlay2: attached loop dev %s to image %s", loopDev.Name(), loopFile)
-
+		if loopDev != nil {
 			loops = append(loops, loopDev)
 		}
 
-		// Mount the device
-		mountRW := false
-		err = d.mountLoopbackDevice(loopDev.Name(), applyDir, id, mountRW)
 		if err != nil {
-			// Failure, but before returning and calling retunrn func
-			// we need to close this loopDev because we haven't increased size
-			// of mounts list used to clean up other loopDevs
-			defer loopDev.Close()
 			return err
 		}
-
-		mounts = append(mounts, applyDir)
 	}
 
 	return nil
@@ -967,100 +984,119 @@ func (d *Driver) Get(id string, mountLabel string) (s string, err error) {
 
 	dir := d.dir(id)
 	if _, err := os.Stat(dir); err != nil {
-		return "", err
+		return "", fmt.Errorf("loop_overlay2: dir %s for image with id %s could not be found", dir, id)
 	}
 
-	diffDir := path.Join(dir, "diff")
 
-	lowers, err := ioutil.ReadFile(path.Join(dir, lowerFile))
-	if err != nil {
-		// If no lower, just return diff directory
-		if os.IsNotExist(err) {
-			return diffDir, nil
-		}
-		return "", err
-	}
+	if loopFile := path.Join(d.findExistingLoopbackPath(id)); loopFile != "" {
 
-	mergedDir := path.Join(dir, "merged")
-	if count := d.ctr.Increment(mergedDir); count > 1 {
-		return mergedDir, nil
-	}
-	defer func() {
+		// This is not the upper RW directory, so ensure loopback device is mounted
+		// read-only at {dir}/diff
+
+
+		diffDir, loopDev, err := d.mountROLoopbackIfNeeded(id, loopFile)
 		if err != nil {
-			if c := d.ctr.Decrement(mergedDir); c <= 0 {
-				syscall.Unmount(mergedDir, 0)
+			if loopDev != nil {
+				defer loopDev.Close()
+			}
+			return "", err
+		} else if diffDir == "" && loopDev != nil {
+			defer loopDev.Close()
+		}
+
+		return diffDir, nil
+	} else {
+		lowers, err2 := ioutil.ReadFile(path.Join(dir, lowerFile))
+		if err2 != nil {
+			// If no lower, just return diff directory
+			if os.IsNotExist(err2) {
+				return d.getDiffPath(id), nil
+			}
+			return "", err2
+		}
+
+		mergedDir := path.Join(dir, "merged")
+		if count := d.ctr.Increment(mergedDir); count > 1 {
+			logrus.Debugf("Ending Get1 with id %s", id)
+			return mergedDir, nil
+		}
+		defer func() {
+			if err != nil {
+				if c := d.ctr.Decrement(mergedDir); c <= 0 {
+					syscall.Unmount(mergedDir, 0)
+				}
+			}
+		}()
+
+		workDir := path.Join(dir, "work")
+		splitLowers := strings.Split(string(lowers), ":")
+		absLowers := make([]string, len(splitLowers))
+
+		lowerIds := make([]string, len(splitLowers))
+
+		for i, s := range splitLowers {
+			absLowers[i] = path.Join(d.home, s)
+			lowerIds[i], err = d.getIdFromLink(absLowers[i])
+			if err != nil {
+				lowerIds = nil
 			}
 		}
-	}()
 
-	workDir := path.Join(dir, "work")
-	splitLowers := strings.Split(string(lowers), ":")
-	absLowers := make([]string, len(splitLowers))
-
-	lowerIds := make([]string, len(splitLowers))
-
-	for i, s := range splitLowers {
-		absLowers[i] = path.Join(d.home, s)
-		lowerIds[i], err = d.getIdFromLink(absLowers[i])
+		err = d.mountLowerIds(lowerIds)
 		if err != nil {
-			lowerIds = nil
+			return "", err
 		}
-	}
 
-	err = d.mountLowerIds(lowerIds)
-	if err != nil {
-		return "", err
-	}
+		opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(absLowers, ":"), path.Join(dir, "diff"), path.Join(dir, "work"))
+		mountData := label.FormatMountLabel(opts, mountLabel)
+		mount := syscall.Mount
+		mountTarget := mergedDir
 
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(absLowers, ":"), path.Join(dir, "diff"), path.Join(dir, "work"))
-	mountData := label.FormatMountLabel(opts, mountLabel)
-	mount := syscall.Mount
-	mountTarget := mergedDir
+		pageSize := syscall.Getpagesize()
 
-	pageSize := syscall.Getpagesize()
+		// Go can return a larger page size than supported by the system
+		// as of go 1.7. This will be fixed in 1.8 and this block can be
+		// removed when building with 1.8.
+		// See https://github.com/golang/go/commit/1b9499b06989d2831e5b156161d6c07642926ee1
+		// See https://github.com/docker/docker/issues/27384
+		if pageSize > 4096 {
+			pageSize = 4096
+		}
 
-	// Go can return a larger page size than supported by the system
-	// as of go 1.7. This will be fixed in 1.8 and this block can be
-	// removed when building with 1.8.
-	// See https://github.com/golang/go/commit/1b9499b06989d2831e5b156161d6c07642926ee1
-	// See https://github.com/docker/docker/issues/27384
-	if pageSize > 4096 {
-		pageSize = 4096
-	}
-
-	// Use relative paths and mountFrom when the mount data has exceeded
-	// the page size. The mount syscall fails if the mount data cannot
-	// fit within a page and relative links make the mount data much
-	// smaller at the expense of requiring a fork exec to chroot.
-	if len(mountData) > pageSize {
-		opts = fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", string(lowers), path.Join(id, "diff"), path.Join(id, "work"))
-		mountData = label.FormatMountLabel(opts, mountLabel)
+		// Use relative paths and mountFrom when the mount data has exceeded
+		// the page size. The mount syscall fails if the mount data cannot
+		// fit within a page and relative links make the mount data much
+		// smaller at the expense of requiring a fork exec to chroot.
 		if len(mountData) > pageSize {
-			return "", fmt.Errorf("cannot mount layer, mount label too large %d", len(mountData))
+			opts = fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", string(lowers), path.Join(id, "diff"), path.Join(id, "work"))
+			mountData = label.FormatMountLabel(opts, mountLabel)
+			if len(mountData) > pageSize {
+				return "", fmt.Errorf("cannot mount layer, mount label too large %d", len(mountData))
+			}
+
+			mount = func(source string, target string, mType string, flags uintptr, label string) error {
+				return mountFrom(d.home, source, target, mType, flags, label)
+			}
+			mountTarget = path.Join(id, "merged")
 		}
 
-		mount = func(source string, target string, mType string, flags uintptr, label string) error {
-			return mountFrom(d.home, source, target, mType, flags, label)
+		if err := mount("overlay", mountTarget, "overlay", 0, mountData); err != nil {
+			return "", fmt.Errorf("error creating overlay mount to %s: %v", mergedDir, err)
 		}
-		mountTarget = path.Join(id, "merged")
-	}
 
-	if err := mount("overlay", mountTarget, "overlay", 0, mountData); err != nil {
-		return "", fmt.Errorf("error creating overlay mount to %s: %v", mergedDir, err)
-	}
+		// chown "workdir/work" to the remapped root UID/GID. Overlay fs inside a
+		// user namespace requires this to move a directory from lower to upper.
+		rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
+		if err != nil {
+			return "", err
+		}
 
-	// chown "workdir/work" to the remapped root UID/GID. Overlay fs inside a
-	// user namespace requires this to move a directory from lower to upper.
-	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
-	if err != nil {
-		return "", err
-	}
+		if err := os.Chown(path.Join(workDir, "work"), rootUID, rootGID); err != nil {
+			return "", err
+		}
 
-	if err := os.Chown(path.Join(workDir, "work"), rootUID, rootGID); err != nil {
-		return "", err
+		return mergedDir, nil
 	}
-
-	return mergedDir, nil
 }
 
 func (d *Driver) unmountLowerIds(ids []string) error {
@@ -1368,6 +1404,8 @@ func (d *Driver) mountLoopbackDevice(dev, path, mountLabel string, mountRW bool)
 	if err := mount.Mount(dev, path, d.filesystem, options); err != nil {
 		return fmt.Errorf("loop_overlay2: Error mounting '%s' on '%s': %s", dev, path, err)
 	}
+
+	logrus.Debugf("loop_overlay2: Mounted loopback device %s at %s, RW=%b", dev, path, mountRW)
 
 	return nil
 }
