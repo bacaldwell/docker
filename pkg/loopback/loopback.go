@@ -61,3 +61,27 @@ func FindLoopDeviceFor(file *os.File) *os.File {
 
 	return nil
 }
+
+// GetLoopDeviceFor returns a loopback device file for the specified file which
+// is backing file of the loop back device passed as a paramter.
+func GetLoopDeviceFor(file *os.File, loopName string) *os.File {
+	stat, err := file.Stat()
+	if err != nil {
+		return nil
+	}
+	targetInode := stat.Sys().(*syscall.Stat_t).Ino
+	targetDevice := stat.Sys().(*syscall.Stat_t).Dev
+
+	file, err = os.OpenFile(loopName, os.O_RDWR, 0)
+	if err != nil {
+		return nil
+	}
+
+	dev, inode, err := getLoopbackBackingFile(file)
+	if err == nil && dev == targetDevice && inode == targetInode {
+		return file
+	}
+	file.Close()
+
+	return nil
+}
