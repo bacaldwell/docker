@@ -226,6 +226,7 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		logrus.Warn(overlayutils.ErrDTypeNotSupported("overlay2", backingFs))
 	}
 
+	// From https://github.com/docker/docker/issues/27358
 	mkfsArgs = append(mkfsArgs, "-n")
 	mkfsArgs = append(mkfsArgs, "ftype=1")
 
@@ -1297,7 +1298,8 @@ func (d *Driver) createFilesystem(devname string) (err error) {
 	logrus.Debugf("loop_overlay2: Creating filesystem %s on device %s", d.filesystem, devname)
 	defer func() {
 		if err != nil {
-			logrus.Infof("loop_overlay2: Error while creating filesystem %s on device %s: %v", d.filesystem, devname, err)
+			logrus.Errorf("loop_overlay2: Error while creating filesystem %s on device %s with args %s: %v",
+				      d.filesystem, devname, args, err)
 		} else {
 			logrus.Infof("loop_overlay2: Successfully created filesystem %s on device %s", d.filesystem, devname)
 		}
